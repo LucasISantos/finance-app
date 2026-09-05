@@ -198,7 +198,7 @@ function makeDefaultBudgets(){
 }
 
 
-const DATA_VERSION = 12;
+const DATA_VERSION = 14;
 const SEEDED_INSTALLMENTS = [];
 SEEDED_INSTALLMENTS.forEach(t=>t.receivableIncludedInOpening=true);
 
@@ -322,23 +322,45 @@ function installmentsFor(tx){
   return arr;
 }
 function monthMetrics(k){
-  let gross=0,personal=0,newCommit=0,extraIncome=0,recordedSalary=0,invest=0,reimbReceived=0,newReceivable=0;
-  const byPkg=Object.fromEntries(ORDER.map(p=>[p,{personal:0,gross:0,commit:0,future:0}]));
+  let gross=0,personal=0,newCommit=0,deferredCommit=0,deferredGrossCommit=0,extraIncome=0,recordedSalary=0,invest=0,reimbReceived=0,newReceivable=0;
+  const byPkg=Object.fromEntries(ORDER.map(p=>[p,{personal:0,gross:0,commit:0,deferredCommit:0,deferredGrossCommit:0,future:0,futureGross:0}]));
   state.transactions.forEach(tx=>{
     if(tx.type==="expense"){
       const reimb=Math.min(Number(tx.reimbursable||0),Number(tx.total||0));
-      if(txMonth(tx.date)===k){
-        newCommit += Number(tx.total||0)-reimb;
-        if(reimb>0 && !tx.receivableIncludedInOpening) newReceivable += reimb;
-      }
-      installmentsFor(tx).forEach(inst=>{
+      const ownTotal=Number(tx.total||0)-reimb;
+      let currentPersonalImpact=0,currentGrossImpact=0;
+      const insts=installmentsFor(tx);
+      insts.forEach(inst=>{
         if(inst.month===k){
           gross+=inst.gross;personal+=inst.personal;
-          if(byPkg[tx.package]){byPkg[tx.package].gross+=inst.gross;byPkg[tx.package].personal+=inst.personal}
+          currentPersonalImpact+=inst.personal;currentGrossImpact+=inst.gross;
+          if(byPkg[tx.package]){
+            byPkg[tx.package].gross+=inst.gross;
+            byPkg[tx.package].personal+=inst.personal;
+          }
         }
-        if(inst.month>k && byPkg[tx.package]) byPkg[tx.package].future+=inst.personal;
+        if(inst.month>k && byPkg[tx.package]){
+          byPkg[tx.package].future+=inst.personal;
+          byPkg[tx.package].futureGross+=inst.gross;
+        }
       });
-      if(txMonth(tx.date)===k && byPkg[tx.package]) byPkg[tx.package].commit += Number(tx.total||0)-reimb;
+      if(txMonth(tx.date)===k){
+        newCommit += ownTotal;
+        const deferred=Math.max(0,ownTotal-currentPersonalImpact);
+        deferredCommit += deferred;
+
+        // Gerencial de caixa: até o reembolso entrar, o compromisso é a parcela bruta.
+        const grossTotal=Number(tx.total||0);
+        const deferredGross=Math.max(0,grossTotal-currentGrossImpact);
+        deferredGrossCommit += deferredGross;
+
+        if(reimb>0 && !tx.receivableIncludedInOpening) newReceivable += reimb;
+        if(byPkg[tx.package]){
+          byPkg[tx.package].commit += ownTotal;
+          byPkg[tx.package].deferredCommit += deferred;
+          byPkg[tx.package].deferredGrossCommit += deferredGross;
+        }
+      }
     } else if(tx.type==="income" && txMonth(tx.date)===k){
       const account=tx.account||"Receita extra";
       if(account==="Salário / Pró-labore") recordedSalary+=Number(tx.total||0);
@@ -349,10 +371,13 @@ function monthMetrics(k){
   });
   const salary=recordedSalary>0?recordedSalary:state.settings.monthlySalary;
   const budget=budgetTotal(k);
-  return {gross,personal,newCommit,extraIncome,invest,reimbReceived,newReceivable,byPkg,salary,budget,
-    netCashSpend:gross-reimbReceived,
-    savingPotential:salary+extraIncome-personal,
-    remaining:budget-personal};
+  const netCashSpend=gross-reimbReceived;
+  const managerialCashSpend=netCashSpend+deferredGrossCommit;
+  return {gross,personal,newCommit,deferredCommit,deferredGrossCommit,managerialCashSpend,extraIncome,invest,reimbReceived,newReceivable,byPkg,salary,budget,
+    netCashSpend,
+    savingPotential:salary+extraIncome-netCashSpend,
+    remaining:budget-netCashSpend,
+    managerialRemaining:budget-managerialCashSpend};
 }
 function annualMetrics(year, throughMonth){
   let personal=0,extraIncome=0,invest=0,salary=0;
@@ -519,7 +544,7 @@ function renderDashboard(){
       <div class="section-title">Acumulado do ano até ${new Date(year,mo-1,1).toLocaleDateString("pt-BR",{month:"long"})}</div>
       <div class="row between"><span class="muted">Receitas do período</span><b>${money(ann.income)}</b></div>
       <div class="row between" style="margin-top:10px"><span class="muted">Gasto que pesa no salário do mês</span><b>${money(ann.personal)}</b></div>
-      <div class="row between" style="margin-top:10px"><span class="muted">Economia potencial</span><b class="${ann.rate>=state.settings.savingsRate?'good':'warn'}">${money(ann.potential)}</b></div>
+      <div class="row between" style="margin-top:10px"><span class="muted">Economia de caixa potencial</span><b class="${ann.rate>=state.settings.savingsRate?'good':'warn'}">${money(ann.potential)}</b></div>
       <div style="margin-top:14px" class="progress ${ann.rate>=state.settings.savingsRate?'':'yellow'}"><div style="width:${clamp(ann.rate/state.settings.savingsRate*100,0,100)}%"></div></div>
       <div class="row between small muted" style="margin-top:7px"><span>Taxa atual ${pct(ann.rate)}</span><span>Meta ${pct(state.settings.savingsRate)}</span></div>
       <div class="footer-note">Para o acumulado de 2026 ficar correto sem importar janeiro–agosto, informe em Configurações o gasto pessoal acumulado antes do início do app.</div>
@@ -546,13 +571,13 @@ function renderBudget(){
   el.innerHTML=`
   <div class="hero">
     <div><h1>Metas do mês</h1><p>${monthLabel(selectedMonth)} · cada pacote tem orçamento e ritmo próprio</p></div>
-    <div class="badge">Saldo de orçamento: <b class="${mm.remaining>=0?'good':'bad'}">${money(mm.remaining)}</b></div>
+    <div class="badge">Quanto ainda posso gastar/assumir: <b class="${mm.managerialRemaining>=0?'good':'bad'}">${money(mm.managerialRemaining)}</b></div>
   </div>
   <div class="grid">
     <div class="card kpi"><div class="label">Meta pessoal do mês</div><div class="value">${money(mm.budget)}</div><div class="sub">Economia planejada: ${money(mm.salary-mm.budget)}</div></div>
-    <div class="card kpi"><div class="label">Gasto que pesa no salário do mês</div><div class="value">${money(mm.personal)}</div><div class="sub">${pct(mm.budget?mm.personal/mm.budget:0)} da meta · exclui a parte que pertence a terceiros.</div></div>
-    <div class="card kpi"><div class="label">Caixa bruto do mês</div><div class="value">${money(mm.gross)}</div><div class="sub">O que você efetivamente precisa pagar/absorver neste mês antes dos reembolsos.</div></div>
-    <div class="card kpi"><div class="label">Desembolso líquido de caixa</div><div class="value">${money(mm.netCashSpend)}</div><div class="sub">Caixa bruto − reembolsos recebidos.</div></div>
+    <div class="card kpi"><div class="label">Quanto ainda posso gastar/assumir</div><div class="value ${mm.managerialRemaining>=0?'good':'bad'}">${money(mm.managerialRemaining)}</div><div class="sub">Meta − caixa que vence agora − compromissos brutos já assumidos para os próximos meses. Reembolso só melhora o saldo quando for recebido.</div></div>
+    <div class="card kpi"><div class="label">Novo caixa futuro contratado</div><div class="value ${mm.deferredGrossCommit>0?'warn':''}">${money(mm.deferredGrossCommit)}</div><div class="sub">Valor bruto ainda a pagar das compras decididas neste mês. A parte de terceiros só alivia quando o reembolso entrar.</div></div>
+    <div class="card kpi"><div class="label">Caixa bruto do mês</div><div class="value">${money(mm.gross)}</div><div class="sub">O que efetivamente vence/sai neste mês, inclusive parte de terceiros.</div></div>
 
     <div class="card span12">
       <div class="section-title">Como ler estes números</div>
@@ -573,20 +598,22 @@ function renderBudget(){
     <div class="card span12">
       <div class="section-title">Orçamento por pacote</div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Pacote</th><th>Meta</th><th>Gasto pessoal</th><th>%</th><th>Saldo</th><th>Novo contratado</th><th>Parcelas futuras</th><th>Status</th></tr></thead>
+        <thead><tr><th>Pacote</th><th>Meta</th><th>Caixa que vence no mês</th><th>% gerencial</th><th>Saldo para gastar/assumir</th><th>Novo caixa futuro contratado</th><th>Parcelas futuras brutas</th><th>Status</th></tr></thead>
         <tbody>
         ${ORDER.filter(p=>(b[p]||mm.byPkg[p]?.personal||0)>0).map(p=>{
-          const x=mm.byPkg[p]||{personal:0,commit:0,future:0}, bud=Number(b[p]||0), ratio=bud?x.personal/bud:0, st=paceStatus(x.personal,bud,selectedMonth);
+          const x=mm.byPkg[p]||{personal:0,gross:0,commit:0,deferredCommit:0,deferredGrossCommit:0,future:0,futureGross:0}, bud=Number(b[p]||0);
+          const managerial=x.gross+(x.deferredGrossCommit||0);
+          const ratio=bud?managerial/bud:0, st=paceStatus(managerial,bud,selectedMonth);
           return `<tr>
-            <td><b>${p}</b></td><td>${money(bud)}</td><td>${money(x.personal)}</td>
+            <td><b>${p}</b></td><td>${money(bud)}</td><td>${money(x.gross)}</td>
             <td style="min-width:130px"><div class="progress ${ratio>1?'red':ratio>.8?'yellow':''}"><div style="width:${clamp(ratio*100,0,100)}%"></div></div><div class="tiny muted" style="margin-top:5px">${pct(ratio)}</div></td>
-            <td class="${bud-x.personal>=0?'good':'bad'}">${money(bud-x.personal)}</td>
-            <td>${money(x.commit)}</td><td>${money(x.future)}</td><td><span class="pill ${st.cls}">${st.label}</span></td>
+            <td class="${bud-managerial>=0?'good':'bad'}">${money(bud-managerial)}</td>
+            <td>${money(x.deferredGrossCommit||0)}</td><td>${money(x.futureGross||0)}</td><td><span class="pill ${st.cls}">${st.label}</span></td>
           </tr>`;
         }).join("")}
         </tbody>
       </table></div>
-      <div class="footer-note">“Gasto pessoal” usa apenas a sua parte das parcelas/gastos que caem no mês. “Novo contratado” mostra o valor pessoal integral das compras feitas no mês, evitando a ilusão de que 6x de R$ 500 é só R$ 500.</div>
+      <div class="footer-note">“Caixa que vence no mês” mostra o valor bruto que você precisa pagar. O “Saldo para gastar/assumir” também desconta os compromissos brutos futuros assumidos agora. Valores a receber de terceiros não aumentam sua capacidade de poupança até serem efetivamente recebidos.</div>
     </div>
   </div>`;
 }
@@ -739,7 +766,7 @@ function renderWealth(){
 
     <div class="card span4">
       <div class="section-title">Economia x destino — ${monthLabel(selectedMonth)}</div>
-      <div class="row between"><span class="muted">Economia potencial do mês</span><b>${money(economicSaving)}</b></div>
+      <div class="row between"><span class="muted">Economia de caixa potencial do mês</span><b>${money(economicSaving)}</b></div>
       <div class="row between" style="margin-top:9px"><span class="muted">Aplicações líquidas no mês</span><b>${money(allocatedThisMonth)}</b></div>
       <div class="row between" style="margin-top:9px"><span class="muted">Economia ainda em caixa</span><b class="info">${money(savingStillInCash)}</b></div>
       <div class="alert good">Exemplo: economizou R$ 6.000 e aplicou R$ 5.000? O resultado do mês continua sendo R$ 6.000. Os R$ 5.000 ficam na aplicação e os R$ 1.000 restantes ficam em conta corrente/reserva.</div>
